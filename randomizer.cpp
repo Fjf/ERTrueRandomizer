@@ -22,10 +22,14 @@ constexpr uint32_t  MIN_PER_STAT       = 0;      // set to 1 if you don't want z
 const char* GDM_PATTERN = "48 8B 05 ? ? ? ? 48 85 C0 74 05 48 8B 40 58 C3 C3";
 
 static void Log(const char* fmt, ...) {
+    static HANDLE s_logMux = CreateMutexA(nullptr, FALSE, "Local\\ERRandomizerLog");
+    if (s_logMux) WaitForSingleObject(s_logMux, 5000);
     FILE* f = fopen("er_randomizer.log", "a");
-    if (!f) return;
-    va_list a; va_start(a, fmt); vfprintf(f, fmt, a); va_end(a);
-    fputc('\n', f); fclose(f);
+    if (f) {
+        va_list a; va_start(a, fmt); vfprintf(f, fmt, a); va_end(a);
+        fputc('\n', f); fclose(f);
+    }
+    if (s_logMux) ReleaseMutex(s_logMux);
 }
 
 static uintptr_t ScanModule(const char* pattern) {
@@ -109,71 +113,113 @@ static bool NonDecreasing(const std::array<uint32_t, 8>& a, const std::array<uin
 }
 
 static DWORD WINAPI Worker(LPVOID) {
+    HANDLE gate = CreateMutexA(nullptr, FALSE, "Local\\ERRandomizerWorker");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        Log("second worker instance detected (DLL loaded twice) - this one exits");
+        return 0;
+    }
+    Log("worker started");
     Sleep(15000); // let the game initialise
 
+    Log("scanning for GameDataMan pattern...");
     uintptr_t hit = 0;
     while (!(hit = ScanModule(GDM_PATTERN))) Sleep(1000);
     g_gdmPtrAddr = hit + 7 + *(int32_t*)(hit + 3);
     Log("GameDataMan ptr at %p", (void*)g_gdmPtrAddr);
 
-    constexpr int STABLE_POLLS = 10;   // 10 * 200ms = 2s unchanged before we trust the baseline
-
     uint32_t prevLevel = 0;
     std::array<uint32_t, 8> prevS{};
-    bool havePrev = false, armed = false, validated = false;
-    int stable = 0;
+    uint8_t* prevPd = nullptr;
+    bool havePrev = false, validated = false, wasValid = false, f9Queued = false, f9WasDown = false;
+    int lost = 0;
 
     for (;;) {
-        Sleep(200);
+        Sleep(100);
         uint8_t* pd = GetPlayerData();
 
+        int f9st = GetAsyncKeyState(VK_F9);
+        bool f9Down = (f9st & 0x8000) != 0;              // physical key state, not consumable
+        bool f9Press = ((f9st & 1) != 0) || (f9Down && !f9WasDown);
+        f9WasDown = f9Down;
+
         uint32_t level = 0; std::array<uint32_t, 8> s{};
-        if (!pd || !ReadState(pd, level, s)) {      // main menu / loading
-            havePrev = false; armed = false; stable = 0;
+        bool readOk = pd && ReadState(pd, level, s);
+        bool ok = readOk && Consistent(level, s);
+
+        if (wasValid && !ok) {                 // just lost the data: loading / transition
+            ++lost;
+            if (lost <= 5)
+                Log("data invalid: %s (level %u) - keeping baseline level %u",
+                    !pd ? "player ptr null" : (readOk ? "inconsistent stats" : "read failed"),
+                    level, prevLevel);
+        }
+        bool justRestored = !wasValid && ok;
+        wasValid = ok;
+        if (!ok) {                                 // keep baseline untouched
+            if (!f9Queued && f9Press) {
+                f9Queued = true;
+                Log("F9 pressed with no player data (menu/loading) - reroll queued");
+            }
             continue;
         }
+        if (justRestored)
+            Log("data restored: level %u, ptr %p (after %d invalid polls)", level, (void*)pd, lost);
 
-        bool forced = (GetAsyncKeyState(VK_F9) & 1) != 0;
-
-        if (!Consistent(level, s)) {                // mid-transition or wrong offsets
-            if (!validated) Log("sanity check failed (level %u) - check offsets", level);
-            continue;
-        }
         if (!validated) { validated = true; Log("offsets validated"); }
 
-        if (forced) {
+        if (f9Queued || f9Press) {                               // forced reroll
+            f9Queued = false;
             Randomize(pd, level);
             ReadState(pd, prevLevel, prevS);
-            havePrev = true;
+            prevPd = pd; havePrev = true; lost = 0;
+            Log("F9 reroll applied at level %u", level);
             continue;
         }
 
-        if (!havePrev) {                            // first good read after load: baseline only
-            prevLevel = level; prevS = s;
-            havePrev = true; armed = false; stable = 0;
+        if (!havePrev) {                            // first good read: baseline only
+            prevLevel = level; prevS = s; prevPd = pd; havePrev = true;
+            Log("baseline: level %u, ptr %p (after %d invalid polls)", level, (void*)pd, lost);
+            lost = 0;
             continue;
         }
 
-        if (level == prevLevel && s == prevS) {     // nothing changed, build trust
-            if (stable < STABLE_POLLS) ++stable;
-            if (stable >= STABLE_POLLS) armed = true;
+        if (pd != prevPd) {                         // new object: load / character switch
+            Log("player ptr changed %p -> %p: load/switch to level %u, no randomize",
+                (void*)prevPd, (void*)pd, level);
+            prevLevel = level; prevS = s; prevPd = pd; lost = 0;
             continue;
         }
-
-        // something changed
-        bool levelUp = armed && level > prevLevel && NonDecreasing(prevS, s);
-        if (levelUp) {
-            Sleep(300); // let the game finish applying the level-up
-            if (ReadState(pd, level, s) && Consistent(level, s)) {
-                Randomize(pd, level);
-                ReadState(pd, prevLevel, prevS);    // new baseline = what we just wrote
-                continue;
+        if (level < prevLevel) {                    // loaded lower save / respec
+            Log("level decreased %u -> %u: load/respec, no randomize", prevLevel, level);
+            prevLevel = level; prevS = s; lost = 0;
+            continue;
+        }
+        if (level == prevLevel) {
+            if (s != prevS) {
+                Log("stats changed at level %u (respec?): no randomize", level);
+                prevS = s; lost = 0;
             }
+            continue;
         }
 
-        // load, character swap, respec, etc: don't randomize, rebuild the baseline
-        armed = false; stable = 0;
-        prevLevel = level; prevS = s;
+        // level increased
+        if (level == prevLevel + 1 && NonDecreasing(prevS, s)) {
+            Log("level up: %u -> %u", prevLevel, level);
+            Sleep(300); // let the game finish applying the level-up
+            uint32_t l2 = 0; std::array<uint32_t, 8> s2{};
+            uint8_t* pd2 = GetPlayerData();
+            if (pd2 == pd && ReadState(pd, l2, s2) && Consistent(l2, s2)) {
+                Randomize(pd, l2);
+                ReadState(pd, prevLevel, prevS);    // new baseline = what we just wrote
+            } else {
+                Log("level up re-read failed, will retry next poll");
+            }
+            lost = 0;
+            continue;
+        }
+
+        Log("level jumped %u -> %u: load, no randomize", prevLevel, level);
+        prevLevel = level; prevS = s; lost = 0;
     }
 }
 
@@ -183,4 +229,4 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID) {
         CreateThread(nullptr, 0, Worker, nullptr, 0, nullptr);
     }
     return TRUE;
-}
+}

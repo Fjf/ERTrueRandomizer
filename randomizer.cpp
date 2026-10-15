@@ -103,6 +103,11 @@ static void Randomize(uint8_t* pd, uint32_t level) {
         level, st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7]);
 }
 
+static bool NonDecreasing(const std::array<uint32_t, 8>& a, const std::array<uint32_t, 8>& b) {
+    for (int i = 0; i < 8; ++i) if (b[i] < a[i]) return false;
+    return true;
+}
+
 static DWORD WINAPI Worker(LPVOID) {
     Sleep(15000); // let the game initialise
 
@@ -111,34 +116,64 @@ static DWORD WINAPI Worker(LPVOID) {
     g_gdmPtrAddr = hit + 7 + *(int32_t*)(hit + 3);
     Log("GameDataMan ptr at %p", (void*)g_gdmPtrAddr);
 
+    constexpr int STABLE_POLLS = 10;   // 10 * 200ms = 2s unchanged before we trust the baseline
+
     uint32_t prevLevel = 0;
-    bool validated = false;
+    std::array<uint32_t, 8> prevS{};
+    bool havePrev = false, armed = false, validated = false;
+    int stable = 0;
 
     for (;;) {
         Sleep(200);
         uint8_t* pd = GetPlayerData();
-        if (!pd) { prevLevel = 0; continue; }   // main menu / loading
 
-        uint32_t level; std::array<uint32_t, 8> s;
-        if (!ReadState(pd, level, s)) { prevLevel = 0; continue; }
+        uint32_t level = 0; std::array<uint32_t, 8> s{};
+        if (!pd || !ReadState(pd, level, s)) {      // main menu / loading
+            havePrev = false; armed = false; stable = 0;
+            continue;
+        }
 
-        bool forced = (GetAsyncKeyState(VK_F9) & 1);
+        bool forced = (GetAsyncKeyState(VK_F9) & 1) != 0;
 
-        if (!Consistent(level, s)) {
-            // mid-transition or wrong offsets
+        if (!Consistent(level, s)) {                // mid-transition or wrong offsets
             if (!validated) Log("sanity check failed (level %u) - check offsets", level);
-            if (!forced) continue;
             continue;
         }
         if (!validated) { validated = true; Log("offsets validated"); }
 
-        bool levelUp = prevLevel != 0 && level > prevLevel;
-        if (levelUp || forced) {
-            Sleep(300); // let the game finish applying the level-up
-            if (ReadState(pd, level, s) && Consistent(level, s))
-                Randomize(pd, level);
+        if (forced) {
+            Randomize(pd, level);
+            ReadState(pd, prevLevel, prevS);
+            havePrev = true;
+            continue;
         }
-        prevLevel = level;
+
+        if (!havePrev) {                            // first good read after load: baseline only
+            prevLevel = level; prevS = s;
+            havePrev = true; armed = false; stable = 0;
+            continue;
+        }
+
+        if (level == prevLevel && s == prevS) {     // nothing changed, build trust
+            if (stable < STABLE_POLLS) ++stable;
+            if (stable >= STABLE_POLLS) armed = true;
+            continue;
+        }
+
+        // something changed
+        bool levelUp = armed && level > prevLevel && NonDecreasing(prevS, s);
+        if (levelUp) {
+            Sleep(300); // let the game finish applying the level-up
+            if (ReadState(pd, level, s) && Consistent(level, s)) {
+                Randomize(pd, level);
+                ReadState(pd, prevLevel, prevS);    // new baseline = what we just wrote
+                continue;
+            }
+        }
+
+        // load, character swap, respec, etc: don't randomize, rebuild the baseline
+        armed = false; stable = 0;
+        prevLevel = level; prevS = s;
     }
 }
 

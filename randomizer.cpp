@@ -203,7 +203,7 @@ static DWORD WINAPI Worker(LPVOID) {
         }
 
         // level increased
-        if (level == prevLevel + 1 && NonDecreasing(prevS, s)) {
+        if (level > prevLevel && NonDecreasing(prevS, s)) {
             Log("level up: %u -> %u", prevLevel, level);
             Sleep(300); // let the game finish applying the level-up
             uint32_t l2 = 0; std::array<uint32_t, 8> s2{};
@@ -229,4 +229,4 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID) {
         CreateThread(nullptr, 0, Worker, nullptr, 0, nullptr);
     }
     return TRUE;
-}
+}
